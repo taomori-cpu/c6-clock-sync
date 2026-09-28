@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>C6 Clock Sync</title>
+<style>
+  :root { color-scheme: light dark; --fg: #1a1f2e; --bg: #f5f6fa; --card: #fff; --accent: #2f6df6; --dim: #6b7280; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #e6e8f0; --bg: #101424; --card: #1b2036; --dim: #9aa3b8; } }
+  body { margin: 0; padding: 16px; font: 16px/1.5 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+  main { max-width: 480px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 8px 0 4px; }
+  p { margin: 6px 0; color: var(--dim); }
+  .card { background: var(--card); border-radius: 12px; padding: 16px; margin: 12px 0; box-shadow: 0 1px 3px rgba(0,0,0,.15); }
+  button { width: 100%; padding: 14px; font-size: 17px; border: 0; border-radius: 10px; background: var(--accent); color: #fff; margin: 6px 0; }
+  button:disabled { opacity: .45; }
+  label { display: block; margin: 10px 0; }
+  input[type=text] { width: 100%; box-sizing: border-box; padding: 10px; font-size: 16px; border-radius: 8px; border: 1px solid #8884; background: transparent; color: var(--fg); }
+  #status { font-weight: 600; }
+  pre { font-size: 13px; white-space: pre-wrap; max-height: 40vh; overflow: auto; color: var(--dim); }
+</style>
+</head>
+<body>
+<main>
+  <h1>C6 Clock Sync</h1>
+  <p>Sends the time, your location and the current weather to the board over Bluetooth. Needs Chrome or Edge (Android, Windows, Mac) or Bluefy on iPhone.</p>
+
+  <div class="card">
+    <div id="status">Not connected</div>
+    <button id="connect">Connect to C6 Clock</button>
+    <button id="sync" disabled>Sync now</button>
+    <label><input type="checkbox" id="auto" checked> Re-sync every 10 minutes while this page is open</label>
+    <label>City (optional, used instead of GPS)
+      <input type="text" id="city" placeholder="e.g. Brisbane">
+    </label>
+  </div>
+
+  <div class="card"><pre id="log"></pre></div>
+</main>
+
+<script>
+const SVC    = '4c6f0001-c6c6-4bbb-9e2f-0123456789ab';
+const TIME   = '4c6f0002-c6c6-4bbb-9e2f-0123456789ab';
+const WX     = '4c6f0003-c6c6-4bbb-9e2f-0123456789ab';
+const CITY   = '4c6f0004-c6c6-4bbb-9e2f-0123456789ab';
+const STATUS = '4c6f0005-c6c6-4bbb-9e2f-0123456789ab';
+
+const $ = id => document.getElementById(id);
+let device, chr = {}, timer;
+
+function log(m) {
+  const t = new Date().toLocaleTimeString();
+  $('log').textContent = `${t}  ${m}\n` + $('log').textContent;
+}
+function setStatus(s) { $('status').textContent = s; }
+
+if (!navigator.bluetooth) {
+  setStatus('Web Bluetooth is not available in this browser');
+  $('connect').disabled = true;
+}
+
+$('connect').onclick = async () => {
+  try {
+    device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SVC] }] });
+    device.addEventListener('gattserverdisconnected', () => {
+      setStatus('Disconnected');
+      $('sync').disabled = true;
+      clearInterval(timer);
+    });
+    setStatus('Connecting…');
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(SVC);
+    chr.time   = await svc.getCharacteristic(TIME);
+    chr.wx     = await svc.getCharacteristic(WX);
+    chr.city   = await svc.getCharacteristic(CITY);
+    chr.status = await svc.getCharacteristic(STATUS);
+    setStatus('Connected to ' + device.name);
+    $('sync').disabled = false;
+    log('connected');
+    await sync();
+    schedule();
+  } catch (e) {
+    log('error: ' + e.message);
+    setStatus('Not connected');
+  }
+};
+
+$('sync').onclick = () => sync().catch(e => log('error: ' + e.message));
+$('auto').onchange = schedule;
+
+function schedule() {
+  clearInterval(timer);
+  if ($('auto').checked && device && device.gatt.connected) {
+    timer = setInterval(() => sync().catch(e => log('error: ' + e.message)), 10 * 60 * 1000);
+  }
+}
+
+function getPosition() {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) return reject(new Error('no geolocation'));
+    navigator.geolocation.getCurrentPosition(
+      p => resolve({ lat: p.coords.latitude, lon: p.coords.longitude }),
+      err => reject(new Error('location unavailable: ' + err.message)),
+      { timeout: 10000, maximumAge: 10 * 60 * 1000 });
+  });
+}
+
+async function geocode(name) {
+  const r = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(name)}&count=1`);
+  const j = await r.json();
+  if (!j.results || !j.results.length) throw new Error('city not found: ' + name);
+  const g = j.results[0];
+  return { lat: g.latitude, lon: g.longitude, name: g.name };
+}
+
+async function reverseGeocode(lat, lon) {
+  try {
+    const r = await fetch(`https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lon}&localityLanguage=en`);
+    const j = await r.json();
+    return j.city || j.locality || j.principalSubdivision || 'GPS';
+  } catch { return 'GPS'; }
+}
+
+async function sync() {
+  if (!device || !device.gatt.connected) throw new Error('not connected');
+
+  // 1. Time: phone clock and the phone's current UTC offset (DST included).
+  const now = Math.floor(Date.now() / 1000);
+  const offset = -new Date().getTimezoneOffset() * 60;
+  const tb = new DataView(new ArrayBuffer(8));
+  tb.setUint32(0, now, true);
+  tb.setInt32(4, offset, true);
+  await chr.time.writeValue(tb.buffer);
+  log(`time sent (UTC${offset >= 0 ? '+' : ''}${offset / 3600})`);
+
+  // 2. Location: typed city, else GPS.
+  let loc;
+  const typed = $('city').value.trim();
+  if (typed) {
+    loc = await geocode(typed);
+  } else {
+    loc = await getPosition();
+    loc.name = await reverseGeocode(loc.lat, loc.lon);
+  }
+  log(`location: ${loc.name} (${loc.lat.toFixed(3)}, ${loc.lon.toFixed(3)})`);
+
+  // 3. Weather from Open-Meteo.
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${loc.lat}&longitude=${loc.lon}` +
+    `&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,is_day` +
+    `&daily=temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=1`;
+  const j = await (await fetch(url)).json();
+  const c = j.current, d = j.daily;
+  const vals = [c.temperature_2m, c.apparent_temperature, c.relative_humidity_2m, c.wind_speed_10m,
+                d.temperature_2m_max[0], d.temperature_2m_min[0], c.weather_code, c.is_day];
+  const wb = new DataView(new ArrayBuffer(16));
+  vals.forEach((v, i) => wb.setInt16(i * 2, Math.round(v), true));
+  await chr.wx.writeValue(wb.buffer);
+  await chr.city.writeValue(new TextEncoder().encode(loc.name.toUpperCase().slice(0, 20)));
+  log(`weather sent: ${Math.round(c.temperature_2m)}°C, code ${c.weather_code}`);
+
+  // 4. Read back what the board now shows.
+  const st = new TextDecoder().decode(await chr.status.readValue());
+  log('board: ' + st);
+  setStatus('Synced · board shows ' + st);
+}
+</script>
+</body>
+</html>
