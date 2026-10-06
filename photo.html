@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>C6 Clock Photos</title>
+<style>
+  :root { color-scheme: light dark; --fg: #1a1f2e; --bg: #f5f6fa; --card: #fff; --accent: #2f6df6; --dim: #6b7280; --bar: #d9dce6; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #e6e8f0; --bg: #101424; --card: #1b2036; --dim: #9aa3b8; --bar: #2a3150; } }
+  body { margin: 0; padding: 16px; font: 16px/1.5 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+  main { max-width: 480px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 8px 0 4px; }
+  p { margin: 6px 0; color: var(--dim); }
+  .card { background: var(--card); border-radius: 12px; padding: 16px; margin: 12px 0; box-shadow: 0 1px 3px rgba(0,0,0,.15); }
+  button, .pick { display: block; box-sizing: border-box; width: 100%; padding: 14px; font-size: 17px; border: 0; border-radius: 10px;
+                  background: var(--accent); color: #fff; margin: 6px 0; text-align: center; }
+  button.quiet { background: var(--bar); color: var(--fg); }
+  button:disabled { opacity: .45; }
+  .pick input { display: none; }
+  label { display: block; margin: 8px 0; }
+  .row { display: flex; gap: 16px; flex-wrap: wrap; }
+  #status { font-weight: 600; }
+  .preview { display: flex; justify-content: center; margin: 8px 0; }
+  canvas { width: 172px; height: 320px; border-radius: 10px; background: #000; image-rendering: pixelated; }
+  progress { width: 100%; height: 10px; }
+  pre { font-size: 13px; white-space: pre-wrap; max-height: 30vh; overflow: auto; color: var(--dim); }
+</style>
+</head>
+<body>
+<main>
+  <h1>C6 Clock Photos</h1>
+  <p>Sends a photo to the board's Photos screen over Bluetooth. Needs Bluefy on iPhone, or Chrome or Edge on
+     Android, Windows and Mac. The board keeps the last 32.</p>
+
+  <div class="card">
+    <label class="pick">Choose photo<input type="file" id="file" accept="image/*"></label>
+    <div class="row">
+      <label><input type="radio" name="mode" value="fill" checked> Fill (crop)</label>
+      <label><input type="radio" name="mode" value="fit"> Fit (bars)</label>
+      <label><input type="checkbox" id="rotate" checked> Turn landscape photos sideways</label>
+    </div>
+    <div class="preview"><canvas id="cv" width="172" height="320"></canvas></div>
+  </div>
+
+  <div class="card">
+    <div id="status">Not connected</div>
+    <button id="connect">Connect to C6 Clock</button>
+    <button id="send" disabled>Send to board</button>
+    <progress id="prog" max="1" value="0"></progress>
+    <button id="clear" class="quiet" disabled>Delete all photos on the board</button>
+  </div>
+
+  <div class="card"><pre id="log"></pre></div>
+</main>
+
+<script>
+const SVC   = '4c6f0001-c6c6-4bbb-9e2f-0123456789ab';
+const PCTRL = '4c6f0006-c6c6-4bbb-9e2f-0123456789ab';
+const PDATA = '4c6f0007-c6c6-4bbb-9e2f-0123456789ab';
+const W = 172, H = 320;
+const WINDOW = 8192;   // bytes in flight past the last ACK; must match main/photo.c
+const ERRORS = { 1: 'wrong image size', 2: 'checksum mismatch', 3: 'flash write failed',
+                 4: 'board buffer overflow', 5: 'board timed out waiting for data' };
+
+const $ = id => document.getElementById(id);
+let device, ctrl, data, img, pixels, busy = false;
+
+function log(m) {
+  const t = new Date().toLocaleTimeString();
+  $('log').textContent = `${t}  ${m}\n` + $('log').textContent;
+}
+function setStatus(s) { $('status').textContent = s; }
+function connected() { return device && device.gatt.connected && ctrl; }
+function refresh() {
+  $('send').disabled = busy || !connected() || !pixels;
+  $('clear').disabled = busy || !connected();
+  $('connect').disabled = busy || !navigator.bluetooth;
+}
+
+if (!navigator.bluetooth) setStatus('Web Bluetooth is not available in this browser');
+refresh();
+
+// ---- image -> 172x320 RGB565, dithered ----
+
+$('file').onchange = () => {
+  const f = $('file').files[0];
+  if (!f) return;
+  const url = URL.createObjectURL(f);
+  const im = new Image();
+  im.onload = () => { img = im; render(); URL.revokeObjectURL(url); };
+  im.onerror = () => log('could not read that image');
+  im.src = url;
+};
+document.querySelectorAll('input[name=mode]').forEach(r => r.onchange = render);
+$('rotate').onchange = render;
+
+function render() {
+  if (!img) return;
+  const cv = $('cv'), g = cv.getContext('2d', { willReadFrequently: true });
+  const fill = document.querySelector('input[name=mode]:checked').value === 'fill';
+  const turn = $('rotate').checked && img.naturalWidth > img.naturalHeight;
+  const iw = turn ? img.naturalHeight : img.naturalWidth;
+  const ih = turn ? img.naturalWidth : img.naturalHeight;
+  const s = fill ? Math.max(W / iw, H / ih) : Math.min(W / iw, H / ih);
+  g.fillStyle = '#000';
+  g.fillRect(0, 0, W, H);
+  g.save();
+  g.translate(W / 2, H / 2);
+  if (turn) g.rotate(Math.PI / 2);
+  g.imageSmoothingQuality = 'high';
+  g.drawImage(img, -img.naturalWidth * s / 2, -img.naturalHeight * s / 2, img.naturalWidth * s, img.naturalHeight * s);
+  g.restore();
+
+  const id = g.getImageData(0, 0, W, H);
+  pixels = toRgb565(id);
+  g.putImageData(id, 0, 0);     // show what the board will show
+  refresh();
+}
+
+// Floyd-Steinberg down to 5-6-5 bits. Writes the quantised colours back into id for the preview
+// and returns big-endian RGB565, the byte order of the board's framebuffer.
+function toRgb565(id) {
+  const d = id.data, err = new Float32Array(W * H * 3);
+  const out = new Uint8Array(W * H * 2);
+  const levels = [31, 63, 31];
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x, q = [0, 0, 0];
+      for (let c = 0; c < 3; c++) {
+        const v = Math.min(255, Math.max(0, d[i * 4 + c] + err[i * 3 + c]));
+        const L = levels[c];
+        q[c] = Math.round(v * L / 255);
+        const e = v - q[c] * 255 / L;
+        d[i * 4 + c] = Math.round(q[c] * 255 / L);
+        if (x + 1 < W) err[(i + 1) * 3 + c] += e * 7 / 16;
+        if (y + 1 < H) {
+          if (x > 0) err[(i + W - 1) * 3 + c] += e * 3 / 16;
+          err[(i + W) * 3 + c] += e * 5 / 16;
+          if (x + 1 < W) err[(i + W + 1) * 3 + c] += e / 16;
+        }
+      }
+      const px = (q[0] << 11) | (q[1] << 5) | q[2];
+      out[i * 2] = px >> 8;
+      out[i * 2 + 1] = px & 0xFF;
+    }
+  }
+  return out;
+}
+
+const CRC_TABLE = new Uint32Array(256).map((_, n) => {
+  let c = n;
+  for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+  return c >>> 0;
+});
+function crc32(buf) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+// ---- BLE ----
+
+// Board replies arrive as notifications on PCTRL; waiters re-check their condition on each one.
+let acked = 0, ready = null, done = null, boardErr = null, waiters = [];
+function onNotify(e) {
+  const v = e.target.value, t = v.getUint8(0);
+  if (t === 0x81) ready = { chunk: v.getUint16(1, true), slot: v.getUint8(3) };
+  else if (t === 0x82) acked = v.getUint32(1, true);
+  else if (t === 0x83) done = { slot: v.getUint8(1), count: v.getUint8(2) };
+  else if (t === 0x8F) boardErr = ERRORS[v.getUint8(1)] || 'error ' + v.getUint8(1);
+  const w = waiters; waiters = []; w.forEach(f => f());
+}
+function waitFor(pred, ms, what) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timed out waiting for ' + what)), ms);
+    const check = () => {
+      if (boardErr) { clearTimeout(timer); reject(new Error('board: ' + boardErr)); }
+      else if (!connected()) { clearTimeout(timer); reject(new Error('disconnected')); }
+      else if (pred()) { clearTimeout(timer); resolve(); }
+      else waiters.push(check);
+    };
+    check();
+  });
+}
+
+$('connect').onclick = async () => {
+  try {
+    device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SVC] }] });
+    device.addEventListener('gattserverdisconnected', () => {
+      ctrl = data = null;
+      setStatus('Disconnected');
+      const w = waiters; waiters = []; w.forEach(f => f());
+      refresh();
+    });
+    setStatus('Connecting…');
+    const svc = await (await device.gatt.connect()).getPrimaryService(SVC);
+    try {
+      ctrl = await svc.getCharacteristic(PCTRL);
+      data = await svc.getCharacteristic(PDATA);
+    } catch {
+      throw new Error('this board firmware has no photo service, flash the latest build');
+    }
+    ctrl.addEventListener('characteristicvaluechanged', onNotify);
+    await ctrl.startNotifications();
+    setStatus('Connected to ' + device.name);
+    log('connected');
+  } catch (e) {
+    ctrl = data = null;
+    log('error: ' + e.message);
+    setStatus('Not connected');
+  }
+  refresh();
+};
+
+async function writeCtrl(bytes) {
+  const b = new Uint8Array(bytes);
+  return ctrl.writeValueWithResponse ? ctrl.writeValueWithResponse(b) : ctrl.writeValue(b);
+}
+
+$('send').onclick = async () => {
+  busy = true; refresh();
+  const px = pixels, len = px.length, t0 = performance.now();
+  try {
+    acked = 0; ready = done = boardErr = null;
+    const start = new DataView(new ArrayBuffer(13));
+    start.setUint8(0, 0x01);
+    start.setUint16(1, W, true);
+    start.setUint16(3, H, true);
+    start.setUint32(5, len, true);
+    start.setUint32(9, crc32(px), true);
+    await writeCtrl(start.buffer);
+    await waitFor(() => ready, 5000, 'the board to get ready');
+
+    const chunk = Math.min(ready.chunk, 512);
+    const write = data.writeValueWithoutResponse ? b => data.writeValueWithoutResponse(b) : b => data.writeValue(b);
+    log(`sending ${len} bytes in ${chunk}-byte packets`);
+    let sent = 0;
+    while (sent < len) {
+      if (sent - acked >= WINDOW) await waitFor(() => sent - acked < WINDOW, 10000, 'the board to write flash');
+      const n = Math.min(chunk, len - sent, WINDOW - (sent - acked));
+      await write(px.slice(sent, sent + n));
+      sent += n;
+      $('prog').value = acked / len * 0.5 + sent / len * 0.5;
+      if (boardErr) throw new Error('board: ' + boardErr);
+    }
+    await waitFor(() => done, 15000, 'the board to finish');
+    $('prog').value = 1;
+    const s = (performance.now() - t0) / 1000;
+    log(`sent in ${s.toFixed(1)} s (${(len / 1024 / s).toFixed(1)} KB/s), board has ${done.count} photos`);
+    setStatus('Photo sent');
+  } catch (e) {
+    log('error: ' + e.message);
+    setStatus('Send failed');
+    if (connected()) writeCtrl([0x02]).catch(() => {});
+  }
+  busy = false; refresh();
+};
+
+$('clear').onclick = async () => {
+  if (!confirm('Delete every photo stored on the board?')) return;
+  try { await writeCtrl([0x03]); log('board photos deleted'); }
+  catch (e) { log('error: ' + e.message); }
+};
+</script>
+</body>
+</html>
